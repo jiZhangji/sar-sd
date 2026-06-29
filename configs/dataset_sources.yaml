@@ -1,0 +1,34 @@
+datasets:
+  sar2opt:
+    provider: huggingface_files
+    repo_id: umkc-mcc/SAR2Opt
+    description: Public 1 m TerraSAR-X / Google Earth pairs; supports tiny download.
+  whu_opt_sar:
+    provider: huggingface_archive
+    repo_id: 125oii/whu_opt_sar
+    include: [optical.zip, sar.zip, lbl.zip]
+    approximate_size_gb: 14.9
+    description: Community mirror of WHU-OPT-SAR; full archives only.
+  sar1m:
+    provider: huggingface_archive
+    repo_id: Wenquandan777/SAR-1M
+    include: [SAR-1M_DATA.zip]
+    approximate_size_gb: 76.6
+    gated: true
+    description: Official SAR-1M archive; HF token/acceptance may be required.
+  sen1_2:
+    provider: tum_ftp
+    description: Official TUM FTP; supports downloading a few exact pairs.
+  soma1m_test:
+    provider: google_drive
+    file_id: 1IFCk6YSKrctfvB9LdeLq8ouvzK7stuK6
+    description: SOMA-1M official test subset published by the authors.
+  qxs_saropt:
+    provider: application
+    url: https://github.com/yaoxu008/QXS-SAROPT
+    description: Official repository links to an access questionnaire; no verified direct public archive.
+  three_mos:
+    provider: application
+    url: https://github.com/3M-OS/3MOS
+    description: Official repository currently points to Baidu NetDisk.
+

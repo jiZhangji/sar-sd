@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.idea/
+.vscode/
+
+# Never commit datasets, weights, caches or experiment outputs.
+/data/
+/weights/
+/runs/
+/outputs/
+/checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.zip
+*.rar
+*.tar
+*.tar.gz

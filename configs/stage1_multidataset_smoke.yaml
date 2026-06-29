@@ -1,0 +1,70 @@
+seed: 42
+
+data:
+  manifest: data/multidataset_smoke/manifest.jsonl
+  image_size: 64
+  batch_size: 2
+  num_workers: 0
+  sampling_temperature: 0.0
+
+metadata:
+  default_gsd: 10.0
+  embedding_dim: 16
+  dataset_dropout: 0.15
+  datasets: [unknown, SAR-1M, SEN1-2, OSDataset, MOS-Ship, QXS-SAROPT, WHU-OPT-SAR, SOMA-1M, 3MOS, SAR2Opt]
+  opt_sensors: [unknown, Sentinel-2, Google-Earth, GF-1]
+  sar_sensors: [unknown, Sentinel-1, TerraSAR-X, GF-3, PIESAT-1, Capella, ALOS-2, RADARSAT-2, RCM]
+  polarizations: [unknown, VV, VH, HH, HV, dual]
+
+model:
+  vae_path: weights/sd-vae-ft-mse
+  unet_from_scratch: true
+  sample_size: 8
+  latent_scale: 0.18215
+  condition_dim: 32
+  cross_attention_dim: 64
+  opt_token_grid: 4
+  layers_per_block: 1
+  block_out_channels: [32, 64]
+  attention_head_dim: 8
+  norm_num_groups: 8
+  enable_gradient_checkpointing: false
+  freeze_unet: false
+
+diffusion:
+  timesteps: 100
+  beta_start: 0.00085
+  beta_end: 0.012
+
+loss:
+  lambda_diffusion: 1.0
+  lambda_physical: 0.05
+  physical_interval: 1
+  adaptive_physical: true
+  physical_target_grad_ratio: 0.05
+  physical_lambda_min: 0.0
+  physical_lambda_max: 0.1
+  physical_lambda_ema: 0.0
+  physical_update_interval: 1
+  physical_warmup_steps: 0
+  physical_max_timestep: 99
+  physical_terms: [mean, variance, cv]
+  physical_window_meters: 50.0
+  physical_window_min: 5
+  physical_window_max: 15
+  physical_eps: 0.0001
+  physical_mean_weight: 1.0
+  physical_variance_weight: 1.0
+  physical_cv_weight: 0.25
+
+train:
+  epochs: 1
+  lr: 0.0001
+  weight_decay: 0.0
+  grad_accum_steps: 1
+  grad_clip: 1.0
+  mixed_precision: fp32
+  output_dir: runs/stage1_multidataset_smoke
+  resume_from:
+  save_every_epochs: 1
+  max_steps: 1

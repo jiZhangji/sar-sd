@@ -1,0 +1,68 @@
+seed: 42
+
+data:
+  manifest: data/multidataset_smoke/manifest.jsonl
+  image_size: 512
+  batch_size: 2
+  num_workers: 4
+  # p(dataset) proportional to N^temperature；0=各数据集等概率，1=按样本量
+  sampling_temperature: 0.5
+
+metadata:
+  default_gsd: 10.0
+  embedding_dim: 64
+  dataset_dropout: 0.15
+  datasets: [unknown, SAR-1M, SEN1-2, OSDataset, MOS-Ship, QXS-SAROPT, WHU-OPT-SAR, SOMA-1M, 3MOS, SAR2Opt]
+  opt_sensors: [unknown, Sentinel-2, Google-Earth, GF-1]
+  sar_sensors: [unknown, Sentinel-1, TerraSAR-X, GF-3, PIESAT-1, Capella, ALOS-2, RADARSAT-2, RCM]
+  polarizations: [unknown, VV, VH, HH, HV, dual]
+
+model:
+  vae_path: weights/sd-vae-ft-mse
+  # 修改为服务器上的完整 SD Diffusers 目录或独立 UNet 目录
+  unet_path: weights/stable-diffusion-v1-5
+  latent_scale: 0.18215
+  condition_dim: 384
+  cross_attention_dim: 768
+  opt_token_grid: 8
+  enable_gradient_checkpointing: true
+  freeze_unet: false
+
+diffusion:
+  timesteps: 1000
+  beta_start: 0.00085
+  beta_end: 0.012
+
+loss:
+  lambda_diffusion: 1.0
+  lambda_physical: 0.05
+  physical_interval: 4
+  adaptive_physical: true
+  physical_target_grad_ratio: 0.05
+  physical_lambda_min: 0.0
+  physical_lambda_max: 0.10
+  physical_lambda_ema: 0.95
+  physical_update_interval: 40
+  physical_warmup_steps: 5000
+  physical_max_timestep: 500
+  # 消融：[ ]、[mean, variance]、[mean, variance, cv]
+  physical_terms: [mean, variance, cv]
+  physical_window_meters: 50.0
+  physical_window_min: 5
+  physical_window_max: 15
+  physical_eps: 0.0001
+  physical_mean_weight: 1.0
+  physical_variance_weight: 1.0
+  physical_cv_weight: 0.25
+
+train:
+  epochs: 100
+  lr: 0.00001
+  weight_decay: 0.00001
+  grad_accum_steps: 1
+  grad_clip: 1.0
+  mixed_precision: fp16
+  output_dir: runs/stage1_opt2sar_pretrain
+  resume_from:
+  save_every_epochs: 1
+  max_steps:

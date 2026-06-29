@@ -1,0 +1,204 @@
+# Stage 1：多数据集 OPT-to-SAR 基础预训练
+
+本工程当前只实现三阶段路线中的第一阶段：使用大规模配准 OPT-SAR 图像对训练通用跨模态基础模型。此阶段没有 layout、bbox、ROI 或检测损失。Stage 2 将在 M4 上做无 layout 域适配，Stage 3 才输入 `SAR_1 + layout` 做局部残差扩充。
+
+## 1. 当前模型
+
+```text
+SAR → 冻结 VAE Encoder → clean latent z0 → DDPM加噪得到zt
+OPT → Optical Encoder ─────────────────────────────┐
+GSD/传感器/极化/入射角 → Metadata Encoder ────────┤
+zt + timestep + OPT tokens + metadata token → UNet → 预测噪声
+```
+
+损失严格保持两项：
+
+```text
+L = L_diffusion + adaptive_lambda_phy * L_physical
+```
+
+- `L_diffusion`：标准噪声预测MSE，始终是主损失。
+- `L_physical`：一个辅助损失，内部只含局部均值、局部方差和局部变异系数。
+- `adaptive_lambda_phy`：根据两项损失对UNet输出层的梯度比例自适应更新，并带warmup、EMA和硬上限。
+
+详细原理见 `docs/03_多数据集异质性与自适应物理损失.md`。
+
+## 2. 目录
+
+```text
+configs/
+  stage1_opt2sar_pretrain.yaml       正式配置
+  stage1_multidataset_smoke.yaml     CPU/小模型冒烟配置
+data/                                本地数据（被.gitignore排除）
+docs/                                设计说明
+lc_osar/data/paired.py               manifest数据集与平衡采样
+lc_osar/models/opt2sar_ldm.py        VAE、OPT/metadata编码器、UNet
+lc_osar/losses.py                    GSD感知物理项和自适应控制器
+tools/download_datasets.py           HF/ModelScope/官方源下载器
+tools/prepare_dataset.py             数据集转统一manifest
+tools/merge_manifests.py             合并多个manifest
+train_stage1.py                      训练
+infer_stage1.py                      DDIM推理
+```
+
+数据、权重和运行结果均被 `.gitignore` 排除，可直接将本目录发布到GitHub。
+
+## 3. 安装
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+正式训练需安装与服务器CUDA匹配的PyTorch。
+
+## 4. 数据下载
+
+```powershell
+python tools\download_datasets.py list
+python tools\download_datasets.py download sar2opt --output D:\opt2sar_raw --limit 2
+python tools\download_datasets.py download sen1_2 --output D:\opt2sar_raw --limit 2
+```
+
+下载器当前支持：
+
+- SEN1-2：从TUM官方FTP按样本下载；
+- SAR2Opt：从Hugging Face按文件下载，可用 `--limit`；
+- WHU-OPT-SAR：从Hugging Face社区镜像下载完整ZIP，约14.9GB，必须加 `--full`；
+- SAR-1M：从Hugging Face下载76.6GB整包，必须加 `--full`，可能需要 `--token`；
+- SOMA-1M test：从作者公开的Google Drive下载，必须加 `--full`；
+- 任意ModelScope数据集：使用 `modelscope` 子命令和真实仓库ID。
+
+完整大包示例：
+
+```powershell
+python tools\download_datasets.py download whu_opt_sar --output D:\opt2sar_raw --full
+python tools\download_datasets.py download sar1m --output D:\opt2sar_raw --full --token $env:HF_TOKEN
+python tools\download_datasets.py download soma1m_test --output D:\opt2sar_raw --full
+```
+
+ModelScope通用下载：
+
+```powershell
+pip install modelscope
+python tools\download_datasets.py modelscope namespace/dataset-name --output D:\opt2sar_raw\dataset-name
+```
+
+QXS-SAROPT和3MOS目前没有经过核验的HF/ModelScope直接公开镜像，下载器会生成访问提示并指向作者官方仓库，不会使用来源不明的转载。所有数据集的转换命令和元数据说明见 `docs/DATASETS.md`。
+
+## 5. Manifest格式
+
+训练使用JSONL或CSV，而不是只靠同名目录：
+
+```json
+{"id":"sen12_001","split":"train","dataset":"SEN1-2","opt_path":"SEN1-2/opt/sen12_001.png","sar_path":"SEN1-2/sar/sen12_001.png","opt_sensor":"Sentinel-2","sar_sensor":"Sentinel-1","opt_gsd":10.0,"sar_gsd":10.0,"polarization":"VV","incidence_angle":null,"sar_unit":"display_uint8"}
+```
+
+必填字段：`id`、`split`、`opt_path`、`sar_path`。建议填写数据集、传感器、GSD、极化、入射角、SAR产品和强度单位。未知信息明确写 `unknown`，不要猜测。
+
+正式划分必须按原始场景或地理区域隔离，不能随机拆分相邻切片。
+
+## 6. 多数据集处理
+
+### 分辨率
+
+模型将 `log(opt_gsd)` 和 `log(sar_gsd)` 的Fourier特征作为metadata token。局部统计窗口由米转换为像素：
+
+```text
+window_px = odd_clip(round(window_meters / sar_gsd), min_px, max_px)
+```
+
+这不会替代预处理。正式数据仍应先配准到共同网格，并按实际地面覆盖范围裁剪，避免把1m和10m数据无脑resize成同一语义尺度。
+
+### 数据平衡
+
+采样概率为 `p(dataset) ∝ N_dataset^temperature`：
+
+- `temperature=1`：按样本量；
+- `temperature=0`：各数据集等概率；
+- 正式配置默认0.5。
+
+### 辐射值
+
+当前小样本为8位展示图，标记为 `display_uint8`，只用于跑通。正式训练应优先把原始SAR定标为 `sigma0/gamma0 dB`，使用训练集确定的传感器级固定裁剪范围，禁止逐图Min-Max后再声称物理统计可比较。
+
+## 7. 自适应物理权重
+
+正式配置：
+
+```yaml
+loss:
+  adaptive_physical: true
+  physical_target_grad_ratio: 0.05
+  physical_lambda_min: 0.0
+  physical_lambda_max: 0.10
+  physical_lambda_ema: 0.95
+  physical_update_interval: 40
+  physical_warmup_steps: 5000
+  physical_max_timestep: 500
+  physical_terms: [mean, variance, cv]
+  physical_window_meters: 50.0
+```
+
+前5000步不启用物理项；之后只在中低噪声时间步计算。控制器目标是让物理项梯度约为扩散梯度的5%，并确保权重不超过0.1。`lambda_physical`仍作为固定权重模式和控制器初值。
+
+推荐消融：
+
+1. `adaptive_physical: false, lambda_physical: 0`；
+2. 固定 `lambda_physical: 0.05`；
+3. 自适应，`physical_terms: [mean, variance]`；
+4. 自适应，`physical_terms: [mean, variance, cv]`。
+
+## 8. 冒烟训练与推理
+
+已验证命令：
+
+```powershell
+python train_stage1.py --config configs\stage1_multidataset_smoke.yaml
+python infer_stage1.py --config configs\stage1_multidataset_smoke.yaml --checkpoint runs\stage1_multidataset_smoke\checkpoints\last.pt --manifest data\multidataset_smoke\manifest.jsonl --output runs\stage1_multidataset_smoke\samples --steps 2 --batch-size 2 --precision fp32
+```
+
+冒烟配置使用64×64输入和从头构建的小UNet，只验证代码，不代表生成质量。
+
+## 9. 正式训练
+
+准备本地SD Diffusers UNet和VAE，修改：
+
+```yaml
+model:
+  vae_path: /path/to/vae
+  unet_path: /path/to/stable-diffusion
+  unet_from_scratch: false
+data:
+  manifest: /path/to/train_manifest.jsonl
+```
+
+启动：
+
+```powershell
+python train_stage1.py --config configs\stage1_opt2sar_pretrain.yaml
+```
+
+输出包括 `config.json`、`metrics.jsonl`、`checkpoints/last.pt` 和按epoch保存的checkpoint。checkpoint保存模型、优化器、AMP scaler、epoch、global step及自适应控制器状态。
+
+断点续训：
+
+```yaml
+train:
+  resume_from: runs/stage1_opt2sar_pretrain/checkpoints/last.pt
+```
+
+## 10. 正式推理
+
+推理也使用manifest，以便提供目标SAR传感器、GSD和极化条件；`sar_path`可以省略：
+
+```powershell
+python infer_stage1.py --config configs\stage1_opt2sar_pretrain.yaml --checkpoint runs\stage1_opt2sar_pretrain\checkpoints\last.pt --manifest data\inference_manifest.jsonl --output outputs\stage1 --steps 50 --batch-size 1 --precision fp16 --seed 42
+```
+
+输出为同名单通道PNG。
+
+## 11. 当前边界
+
+当前元数据通过cross-attention token注入，还不是完整的Scale-MAE位置编码或DOFA动态卷积；OPT编码器仍是轻量单尺度CNN。下一步应先做SAR VAE重建检查，再决定是否增加多尺度OPT特征注入。Stage 2和Stage 3尚未混入本工程。
