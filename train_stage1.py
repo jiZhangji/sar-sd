@@ -57,8 +57,17 @@ def save_checkpoint(path, model, optimizer, scaler, controller, epoch, global_st
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
+    parser.add_argument("--manifest", help="Override data.manifest from YAML")
+    parser.add_argument("--output-dir", help="Override train.output_dir from YAML")
+    parser.add_argument("--resume-from", help="Override train.resume_from from YAML")
     args = parser.parse_args()
     cfg = load_config(args.config)
+    if args.manifest:
+        cfg["data"]["manifest"] = args.manifest
+    if args.output_dir:
+        cfg["train"]["output_dir"] = args.output_dir
+    if args.resume_from:
+        cfg["train"]["resume_from"] = args.resume_from
     seed_everything(cfg.get("seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

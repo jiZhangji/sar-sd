@@ -2,6 +2,58 @@
 
 本工程当前只实现三阶段路线中的第一阶段：使用大规模配准 OPT-SAR 图像对训练通用跨模态基础模型。此阶段没有 layout、bbox、ROI 或检测损失。Stage 2 将在 M4 上做无 layout 域适配，Stage 3 才输入 `SAR_1 + layout` 做局部残差扩充。
 
+## 服务器一键启动
+
+项目默认适配以下服务器路径：
+
+```text
+数据：/inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/dataset
+代码：/inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/sar-sd
+```
+
+先用每个数据集100对验证预处理和训练入口：
+
+```bash
+cd /inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/sar-sd
+chmod +x run_stage1.sh
+LIMIT_PER_DATASET=100 bash run_stage1.sh
+```
+
+确认无误后处理全部数据并启动正式预训练：
+
+```bash
+LIMIT_PER_DATASET=0 bash run_stage1.sh
+```
+
+首次训练会通过Diffusers下载并缓存 `stabilityai/sd-vae-ft-mse` 和 Stable Diffusion v1.5 UNet。若服务器不能访问Hugging Face，请提前下载权重并把 `configs/stage1_opt2sar_pretrain.yaml` 中的 `vae_path`、`unet_path` 改为本地绝对路径。
+
+全量预处理会解压/抽取大量文件，需要为SAR-1M和WHU额外预留足够磁盘空间与inode。建议一定先运行 `LIMIT_PER_DATASET=100`。
+
+脚本会自动：
+
+1. 从 `SAR-1M_full/SAR-1M_DATA.zip` 的 `paired.json` 抽取配对数据；
+2. 解压并配对 `whu_opt_sar/optical.zip` 与 `sar.zip`，忽略标签ZIP；
+3. 使用 `SAR2Opt_full/A` 和 `B`，忽略重复的Pix2Pix拼接目录；
+4. 明确跳过 `M4-SAR`，将其留给Stage 2；
+5. 在 `dataset/stage1_prepared/` 写入统一图像、manifest和统计文件；
+6. 将manifest传给 `train_stage1.py` 启动训练。
+
+自定义路径：
+
+```bash
+DATASET_ROOT=/path/to/dataset \
+PROJECT_ROOT=/path/to/sar-sd \
+PREPARED_ROOT=/path/to/prepared \
+OUTPUT_DIR=/path/to/runs/stage1 \
+bash run_stage1.sh
+```
+
+断点续训：
+
+```bash
+bash run_stage1.sh --resume-from /path/to/checkpoints/last.pt
+```
+
 ## 1. 当前模型
 
 ```text

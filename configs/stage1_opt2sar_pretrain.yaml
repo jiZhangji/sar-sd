@@ -18,9 +18,9 @@ metadata:
   polarizations: [unknown, VV, VH, HH, HV, dual]
 
 model:
-  vae_path: weights/sd-vae-ft-mse
-  # 修改为服务器上的完整 SD Diffusers 目录或独立 UNet 目录
-  unet_path: weights/stable-diffusion-v1-5
+  # 在线运行时由Diffusers自动缓存；离线服务器可改为对应本地目录。
+  vae_path: stabilityai/sd-vae-ft-mse
+  unet_path: stable-diffusion-v1-5/stable-diffusion-v1-5
   latent_scale: 0.18215
   condition_dim: 384
   cross_attention_dim: 768
