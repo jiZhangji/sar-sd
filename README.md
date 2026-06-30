@@ -372,3 +372,47 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 train_stage1.p
 ```
 
 显式传入 `--lr` 时，训练器会在恢复 optimizer 状态后覆盖其学习率；不传则保留 checkpoint 学习率。
+
+### 13.6 nohup 后台启动双H100
+
+`train_h100_2gpu.sh` 默认使用两张GPU、每卡batch size 64、20个epoch和Hugging Face离线缓存。启动：
+
+```bash
+cd /inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/sar-sd
+mkdir -p runs/stage1_opt2sar_pretrain
+
+nohup bash train_h100_2gpu.sh \
+  > runs/stage1_opt2sar_pretrain/train.log 2>&1 &
+
+echo $! > runs/stage1_opt2sar_pretrain/train.pid
+```
+
+查看日志：
+
+```bash
+tail -f runs/stage1_opt2sar_pretrain/train.log
+```
+
+查看进程和GPU：
+
+```bash
+cat runs/stage1_opt2sar_pretrain/train.pid
+ps -fp "$(cat runs/stage1_opt2sar_pretrain/train.pid)"
+watch -n 1 nvidia-smi
+```
+
+停止训练（先向torchrun主进程发送TERM）：
+
+```bash
+kill -TERM "$(cat runs/stage1_opt2sar_pretrain/train.pid)"
+```
+
+临时覆盖参数，例如每卡32、10个epoch：
+
+```bash
+BATCH_SIZE=32 EPOCHS=10 nohup bash train_h100_2gpu.sh \
+  > runs/stage1_opt2sar_pretrain/train.log 2>&1 &
+echo $! > runs/stage1_opt2sar_pretrain/train.pid
+```
+
+如果模型尚未缓存完整，可在前台临时启用联网模式：`OFFLINE=0 bash train_h100_2gpu.sh`。正式双卡训练建议先确认VAE和UNet已缓存，再保持默认 `OFFLINE=1`，避免两个DDP进程同时访问Hugging Face。
