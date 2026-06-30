@@ -125,6 +125,9 @@ def main():
     parser.add_argument("--manifest", help="Override data.manifest from YAML")
     parser.add_argument("--output-dir", help="Override train.output_dir from YAML")
     parser.add_argument("--resume-from", help="Override train.resume_from from YAML")
+    parser.add_argument("--batch-size", type=int, help="Override per-process data.batch_size")
+    parser.add_argument("--epochs", type=int, help="Override total target epoch count")
+    parser.add_argument("--lr", type=float, help="Override learning rate, including after resume")
     args = parser.parse_args()
     cfg = load_config(args.config)
     if args.manifest:
@@ -133,6 +136,12 @@ def main():
         cfg["train"]["output_dir"] = args.output_dir
     if args.resume_from:
         cfg["train"]["resume_from"] = args.resume_from
+    if args.batch_size is not None:
+        cfg["data"]["batch_size"] = args.batch_size
+    if args.epochs is not None:
+        cfg["train"]["epochs"] = args.epochs
+    if args.lr is not None:
+        cfg["train"]["lr"] = args.lr
     seed_everything(cfg.get("seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -169,6 +178,10 @@ def main():
         state = torch.load(resume, map_location=device)
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
+        if args.lr is not None:
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = args.lr
+                param_group["initial_lr"] = args.lr
         scaler.load_state_dict(state.get("scaler", {}))
         physical_controller.load_state_dict(state.get("physical_controller", {}))
         start_epoch = int(state["epoch"])

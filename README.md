@@ -274,3 +274,101 @@ python tools/audit_stage1_data.py \
 ```
 
 终端和 `stage1_prepared/audit_report.json` 会输出 `PASS` 或 `FAIL`。`FAIL` 时返回非零退出码，可用于训练前自动阻止。SAR2Opt 不需要复制到 `stage1_prepared`；manifest 正确引用原始 A/B 文件即视为已包含。
+
+## 13. 服务器全量训练、输入输出和断点续训
+
+### 13.1 输入和输出
+
+默认服务器原始数据目录：
+
+```text
+/inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/dataset
+```
+
+第一阶段训练输入是 `dataset/stage1_prepared/manifest.jsonl`。manifest 应包含 SAR-1M、WHU-OPT-SAR 和 SAR2Opt，不应包含留给第二阶段的 M4-SAR。
+
+默认输出：
+
+```text
+runs/stage1_opt2sar_pretrain/config.json
+runs/stage1_opt2sar_pretrain/metrics.jsonl
+runs/stage1_opt2sar_pretrain/tensorboard/
+runs/stage1_opt2sar_pretrain/checkpoints/last.pt
+runs/stage1_opt2sar_pretrain/checkpoints/epoch_0002.pt
+runs/stage1_opt2sar_pretrain/samples/epoch_0002/
+```
+
+### 13.2 安装和数据审计
+
+```bash
+cd /inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/sar-sd
+pip install -r requirements.txt
+
+python tools/audit_stage1_data.py \
+  --dataset-root /inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/dataset \
+  --prepared-root /inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/dataset/stage1_prepared
+```
+
+只有审计输出 `PASS` 后再启动全量训练。
+
+### 13.3 全量训练
+
+不重新预处理数据，直接使用已审计的 manifest：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train_stage1.py \
+  --config configs/stage1_opt2sar_pretrain.yaml \
+  --manifest /inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/dataset/stage1_prepared/manifest.jsonl \
+  --output-dir runs/stage1_opt2sar_pretrain \
+  --batch-size 8 \
+  --epochs 10
+```
+
+`--batch-size` 是每个训练进程的 batch size，也可在 `configs/stage1_opt2sar_pretrain.yaml` 的 `data.batch_size` 修改。对单张 H100 80GB、512×512 输入且开启物理损失，建议从8开始；显存稳定后测试12和16。batch并非越大越好：它会增加吞吐量和梯度稳定性，但可能降低泛化并改变合适的学习率。
+
+当前训练器是单进程单卡版，`CUDA_VISIBLE_DEVICES=0,1` 不会自动使用两张卡，也不应直接用 `torchrun`，否则两个进程会同时写入同一份日志和权重。
+
+### 13.4 训练时查看
+
+终端进度条会实时显示 `loss`、`diffusion`、`physical`、`lambda_phy` 和 `lr`。另开一个终端启动 TensorBoard：
+
+```bash
+cd /inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/sar-sd
+tensorboard --logdir runs/stage1_opt2sar_pretrain/tensorboard --host 0.0.0.0 --port 6006
+```
+
+查看每轮汇总日志和最新生成图：
+
+```bash
+tail -f runs/stage1_opt2sar_pretrain/metrics.jsonl
+find runs/stage1_opt2sar_pretrain/samples -maxdepth 2 -type f | tail -n 20
+```
+
+### 13.5 10轮后断点续训
+
+`--epochs` 表示从第1轮开始计算的“总目标轮数”，不是额外轮数。例如已练完10轮，希望续训到20轮：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train_stage1.py \
+  --config configs/stage1_opt2sar_pretrain.yaml \
+  --manifest /inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/dataset/stage1_prepared/manifest.jsonl \
+  --output-dir runs/stage1_opt2sar_pretrain \
+  --resume-from runs/stage1_opt2sar_pretrain/checkpoints/last.pt \
+  --batch-size 8 \
+  --epochs 20
+```
+
+当前默认学习率是固定的 `1e-5`，没有学习率调度器。断点续训会恢复优化器并继续使用 checkpoint 中的学习率。如果10轮后已接近收敛，可显式降到 `5e-6`：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train_stage1.py \
+  --config configs/stage1_opt2sar_pretrain.yaml \
+  --manifest /inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/dataset/stage1_prepared/manifest.jsonl \
+  --output-dir runs/stage1_opt2sar_pretrain \
+  --resume-from runs/stage1_opt2sar_pretrain/checkpoints/last.pt \
+  --batch-size 8 \
+  --epochs 20 \
+  --lr 5e-6
+```
+
+显式传入 `--lr` 时，训练器会在恢复 optimizer 状态后覆盖其学习率；不传则保留 checkpoint 学习率。
