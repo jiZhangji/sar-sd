@@ -234,6 +234,14 @@ python train_stage1.py --config configs\stage1_opt2sar_pretrain.yaml
 
 输出包括 `config.json`、`metrics.jsonl`、`checkpoints/last.pt` 和按epoch保存的checkpoint。checkpoint保存模型、优化器、AMP scaler、epoch、global step及自适应控制器状态。
 
+正式配置默认训练10个epoch，每50个batch记录一次TensorBoard标量，每个epoch更新 `last.pt`，并在第2、4、6、8、10个epoch保存编号权重。建议在第5轮做中期评估；第10轮仍有明显改善时，再从 `last.pt` 续训到15至20轮。查看日志：
+
+第2、4、6、8、10轮保存权重后，训练器还会用固定的前4个验证样本执行50步DDIM推理。每个样本的OPT、真实SAR和生成SAR保存到 `runs/stage1_opt2sar_pretrain/samples/epoch_XXXX/`，生成结果也会写入TensorBoard。
+
+```bash
+tensorboard --logdir runs/stage1_opt2sar_pretrain/tensorboard --host 0.0.0.0 --port 6006
+```
+
 断点续训：
 
 ```yaml
@@ -254,3 +262,15 @@ python infer_stage1.py --config configs\stage1_opt2sar_pretrain.yaml --checkpoin
 ## 11. 当前边界
 
 当前元数据通过cross-attention token注入，还不是完整的Scale-MAE位置编码或DOFA动态卷积；OPT编码器仍是轻量单尺度CNN。下一步应先做SAR VAE重建检查，再决定是否增加多尺度OPT特征注入。Stage 2和Stage 3尚未混入本工程。
+
+## 12. 审计全量预处理结果
+
+审计脚本会从原始 ZIP/A/B 目录重新计算可用配对，并检查 manifest 是否完整收录、路径是否存在、ID/配对是否重复、划分是否合法，以及 M4 是否被误加入第一阶段：
+
+```bash
+python tools/audit_stage1_data.py \
+  --dataset-root /inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/dataset \
+  --prepared-root /inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/dataset/stage1_prepared
+```
+
+终端和 `stage1_prepared/audit_report.json` 会输出 `PASS` 或 `FAIL`。`FAIL` 时返回非零退出码，可用于训练前自动阻止。SAR2Opt 不需要复制到 `stage1_prepared`；manifest 正确引用原始 A/B 文件即视为已包含。

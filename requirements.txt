@@ -8,5 +8,6 @@ numpy>=1.24
 Pillow>=10.0
 PyYAML>=6.0
 tqdm>=4.66
+tensorboard>=2.16
 huggingface_hub>=0.23
 gdown>=5.2

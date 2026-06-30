@@ -56,7 +56,8 @@ loss:
   physical_cv_weight: 0.25
 
 train:
-  epochs: 100
+  # 733k pairs: start with 10 epochs, then decide whether to extend to 20 from validation samples.
+  epochs: 10
   lr: 0.00001
   weight_decay: 0.00001
   grad_accum_steps: 1
@@ -64,5 +65,9 @@ train:
   mixed_precision: fp16
   output_dir: runs/stage1_opt2sar_pretrain
   resume_from:
-  save_every_epochs: 1
+  log_every_steps: 50
+  save_every_epochs: 2
+  validation_every_epochs: 2
+  validation_num_samples: 4
+  validation_inference_steps: 50
   max_steps:

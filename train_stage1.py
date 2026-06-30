@@ -8,8 +8,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import DDPMScheduler
+from diffusers import DDIMScheduler, DDPMScheduler
+from PIL import Image
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from lc_osar.config import load_config
@@ -40,6 +42,69 @@ def build_loader(cfg):
         pin_memory=torch.cuda.is_available(),
         drop_last=True,
     )
+
+
+def build_validation_loader(cfg):
+    data_cfg = cfg["data"]
+    dataset = MultiDatasetOptSarDataset(
+        data_cfg["manifest"], "val", data_cfg["image_size"], cfg["metadata"]
+    )
+    return DataLoader(
+        dataset,
+        batch_size=int(cfg["train"].get("validation_num_samples", 4)),
+        shuffle=False,
+        num_workers=min(2, data_cfg.get("num_workers", 4)),
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
+def save_image(tensor, path):
+    tensor = tensor.detach().float().clamp(-1, 1).add(1).mul(127.5).byte().cpu()
+    array = tensor.numpy()
+    if array.shape[0] == 1:
+        Image.fromarray(array[0]).save(path)
+    else:
+        Image.fromarray(array[:3].transpose(1, 2, 0)).save(path)
+
+
+@torch.inference_mode()
+def generate_validation_samples(model, loader, cfg, device, epoch, output_dir, writer, use_amp):
+    """Generate a fixed first validation batch for qualitative monitoring."""
+    model.eval()
+    batch = next(iter(loader))
+    optical = batch["opt"].to(device, non_blocking=True)
+    metadata = metadata_from_batch(batch, device)
+    sample_steps = int(cfg["train"].get("validation_inference_steps", 50))
+    scheduler = DDIMScheduler(
+        num_train_timesteps=cfg["diffusion"]["timesteps"],
+        beta_start=cfg["diffusion"]["beta_start"],
+        beta_end=cfg["diffusion"]["beta_end"],
+        beta_schedule="linear", prediction_type="epsilon", clip_sample=False,
+    )
+    scheduler.set_timesteps(sample_steps, device=device)
+    latent_size = cfg["data"]["image_size"] // 8
+    generator = torch.Generator(device=device).manual_seed(int(cfg.get("seed", 42)))
+    latent = torch.randn(
+        len(optical), model.unet.config.in_channels, latent_size, latent_size,
+        generator=generator, device=device,
+    )
+    for timestep in tqdm(scheduler.timesteps, desc=f"validation epoch {epoch}", leave=False):
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            noise = model(latent, timestep.expand(len(optical)), optical, metadata)
+        latent = scheduler.step(noise.float(), timestep, latent).prev_sample
+    generated = model.decode_sar(latent)
+    sample_dir = output_dir / "samples" / f"epoch_{epoch:04d}"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    for index, stem in enumerate(batch["stem"]):
+        save_image(optical[index], sample_dir / f"{stem}_opt.png")
+        save_image(batch["sar"][index], sample_dir / f"{stem}_real_sar.png")
+        save_image(generated[index], sample_dir / f"{stem}_generated_sar.png")
+    writer.add_images("validation/generated_sar", generated.add(1).div(2), epoch)
+    writer.add_images("validation/real_sar", batch["sar"].add(1).div(2), epoch)
+    writer.flush()
+    model.train()
+    model.vae.eval()
+    print(f"[validation] saved {len(generated)} samples to {sample_dir}")
 
 
 def save_checkpoint(path, model, optimizer, scaler, controller, epoch, global_step, cfg):
@@ -89,6 +154,7 @@ def main():
     use_amp = device.type == "cuda" and cfg["train"].get("mixed_precision") == "fp16"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     loader = build_loader(cfg)
+    validation_loader = build_validation_loader(cfg)
     physical_controller = AdaptivePhysicalWeight(cfg["loss"])
 
     output_dir = Path(cfg["train"]["output_dir"])
@@ -96,6 +162,7 @@ def main():
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     metrics_path = output_dir / "metrics.jsonl"
+    writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
     start_epoch = global_step = 0
     resume = cfg["train"].get("resume_from")
     if resume:
@@ -112,6 +179,7 @@ def main():
     physical_warmup = int(cfg["loss"].get("physical_warmup_steps", 0))
     physical_max_timestep = int(cfg["loss"].get("physical_max_timestep", cfg["diffusion"]["timesteps"] - 1))
     adaptive_update_interval = int(cfg["loss"].get("physical_update_interval", 50))
+    log_every = int(cfg["train"].get("log_every_steps", 50))
     probe_parameter = model.unet.conv_out.weight
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(start_epoch, cfg["train"]["epochs"]):
@@ -184,7 +252,17 @@ def main():
                 sums[key] = sums.get(key, 0.0) + float(value.detach())
             steps += 1
             global_step += 1
-            progress.set_postfix(loss=f"{sums['loss'] / steps:.4f}")
+            progress.set_postfix(
+                loss=f"{sums['loss'] / steps:.4f}",
+                diffusion=f"{float(diffusion_loss.detach()):.4f}",
+                physical=f"{float(physical_loss.detach()):.4f}",
+                lambda_phy=f"{lambda_physical:.4f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+            )
+            if log_every > 0 and global_step % log_every == 0:
+                for key, value in values.items():
+                    writer.add_scalar(f"train/{key}", float(value.detach()), global_step)
+                writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
 
         if steps % grad_accum != 0:
             scaler.unscale_(optimizer)
@@ -196,10 +274,21 @@ def main():
         row = {"epoch": epoch + 1, "global_step": global_step, **{k: v / max(steps, 1) for k, v in sums.items()}}
         with metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row) + "\n")
+        for key, value in row.items():
+            if key not in {"epoch", "global_step"}:
+                writer.add_scalar(f"epoch/{key}", value, epoch + 1)
+        writer.flush()
         save_checkpoint(checkpoint_dir / "last.pt", model, optimizer, scaler, physical_controller, epoch + 1, global_step, cfg)
         if (epoch + 1) % cfg["train"].get("save_every_epochs", 1) == 0:
             save_checkpoint(checkpoint_dir / f"epoch_{epoch + 1:04d}.pt", model, optimizer, scaler, physical_controller, epoch + 1, global_step, cfg)
+        validation_interval = int(cfg["train"].get("validation_every_epochs", 0))
+        if validation_interval > 0 and (epoch + 1) % validation_interval == 0:
+            generate_validation_samples(
+                model, validation_loader, cfg, device, epoch + 1,
+                output_dir, writer, use_amp,
+            )
         print(row)
+    writer.close()
 
 
 if __name__ == "__main__":
