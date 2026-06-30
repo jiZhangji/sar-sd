@@ -280,26 +280,31 @@ def main():
                 physical_loss = diffusion_loss.new_zeros(())
                 physical_metrics = {}
                 physical_mask = timestep <= physical_max_timestep
+                physical_indices = physical_mask.nonzero(as_tuple=False).flatten()
+                physical_max_samples = int(cfg["loss"].get("physical_max_samples_per_rank", 0))
+                if physical_max_samples > 0:
+                    physical_indices = physical_indices[:physical_max_samples]
                 physical_scheduled = (
                     physical_interval > 0
                     and global_step >= physical_warmup
                     and global_step % physical_interval == 0
                 )
                 use_physical = physical_scheduled and all_ranks_have_physical_samples(
-                    bool(physical_mask.any()), device, world_size
+                    len(physical_indices) > 0, device, world_size
                 )
                 if use_physical:
-                    selected_t = timestep[physical_mask]
+                    selected_t = timestep[physical_indices]
                     alpha = alphas_cumprod[selected_t].view(-1, 1, 1, 1)
                     pred_clean = (
-                        noisy_latent[physical_mask]
-                        - (1.0 - alpha).sqrt() * prediction[physical_mask]
+                        noisy_latent[physical_indices]
+                        - (1.0 - alpha).sqrt() * prediction[physical_indices]
                     ) / alpha.sqrt()
                     pred_sar = raw_model.decode_sar(pred_clean, with_grad=True)
                     physical_loss, physical_metrics = sar_physical_loss(
-                        pred_sar.float(), sar[physical_mask].float(),
-                        metadata["sar_gsd"][physical_mask], cfg["loss"]
+                        pred_sar.float(), sar[physical_indices].float(),
+                        metadata["sar_gsd"][physical_indices], cfg["loss"]
                     )
+                    physical_metrics["physical_batch_samples"] = physical_loss.new_tensor(len(physical_indices))
                     if (
                         physical_controller.enabled
                         and adaptive_update_interval > 0

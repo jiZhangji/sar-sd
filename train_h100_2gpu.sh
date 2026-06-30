@@ -11,10 +11,11 @@ EPOCHS="${EPOCHS:-20}"
 CUDA_DEVICES="${CUDA_DEVICES:-0,1}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # Set OFFLINE=0 only when the model cache is incomplete and network access is required.
 OFFLINE="${OFFLINE:-1}"
-export HF_HOME OMP_NUM_THREADS
+export HF_HOME OMP_NUM_THREADS PYTORCH_CUDA_ALLOC_CONF
 if [[ "${OFFLINE}" == "1" ]]; then
   export HF_HUB_OFFLINE=1
   export TRANSFORMERS_OFFLINE=1
@@ -31,6 +32,7 @@ echo "[launch] manifest=${MANIFEST}"
 echo "[launch] output=${OUTPUT_DIR}"
 echo "[launch] GPUs=${CUDA_DEVICES}, per_gpu_batch=${BATCH_SIZE}, epochs=${EPOCHS}"
 echo "[launch] global_batch=$((BATCH_SIZE * NPROC_PER_NODE)), offline=${OFFLINE}"
+echo "[launch] PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
 
 CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" torchrun \
   --standalone \

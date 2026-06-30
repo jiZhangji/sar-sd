@@ -49,6 +49,8 @@ loss:
   physical_update_interval: 40
   physical_warmup_steps: 5000
   physical_max_timestep: 500
+  # Limit differentiable VAE decodes; all samples still train the diffusion loss.
+  physical_max_samples_per_rank: 4
   # 消融：[ ]、[mean, variance]、[mean, variance, cv]
   physical_terms: [mean, variance, cv]
   physical_window_meters: 50.0

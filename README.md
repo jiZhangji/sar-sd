@@ -451,4 +451,10 @@ CUDA_VISIBLE_DEVICES=0 python train_stage1.py \
 
 本项目的正式模型只从Hub加载 `stabilityai/sd-vae-ft-mse` VAE和 `stable-diffusion-v1-5/stable-diffusion-v1-5` 下的 `unet/`；不加载tokenizer、text encoder或完整Stable Diffusion pipeline。
 
+### 13.9 物理损失显存上限
+
+正式配置使用 `physical_max_samples_per_rank: 4`。每张GPU在一个物理步中最多抽4个中低噪声样本执行带梯度VAE解码；其余样本仍全部参与标准扩散损失。这只限制高显存的辅助分支，不改变全局batch size。TensorBoard中的 `physical_batch_samples` 会记录实际数量。
+
+H100脚本默认设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 以减少显存碎片；该选项不会替代对真实峰值的限制。
+
 正式配置默认 `data.validate_paths: false`，因为全量数据已由 `audit_stage1_data.py` 完成一次完整性审计。如果启动时再由每个DDP进程遍历73万对数据并检查约146万个路径，共享文件系统上会长时间无输出。训练器现在会明确输出模型加载、manifest读取、样本数和每rank batch数。
