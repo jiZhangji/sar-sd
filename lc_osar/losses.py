@@ -64,11 +64,15 @@ class AdaptivePhysicalWeight:
     def _norm(gradient):
         return gradient.detach().float().norm() if gradient is not None else torch.tensor(0.0)
 
-    def update(self, diffusion_loss, physical_loss, probe_parameter):
+    def update(self, diffusion_loss, physical_loss, probe_tensor):
+        """Update from loss gradients at the UNet noise-prediction output.
+
+        Probing a non-leaf output avoids interfering with DDP parameter reducer hooks.
+        """
         if not self.enabled:
             return self.value
-        grad_diff = torch.autograd.grad(diffusion_loss, probe_parameter, retain_graph=True, allow_unused=True)[0]
-        grad_phy = torch.autograd.grad(physical_loss, probe_parameter, retain_graph=True, allow_unused=True)[0]
+        grad_diff = torch.autograd.grad(diffusion_loss, probe_tensor, retain_graph=True, allow_unused=True)[0]
+        grad_phy = torch.autograd.grad(physical_loss, probe_tensor, retain_graph=True, allow_unused=True)[0]
         diff_norm = float(self._norm(grad_diff).cpu())
         phy_norm = float(self._norm(grad_phy).cpu())
         if diff_norm > 0.0 and phy_norm > 0.0:

@@ -2,12 +2,15 @@
 
 import argparse
 import json
+import os
 import random
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from diffusers import DDIMScheduler, DDPMScheduler
 from PIL import Image
 from torch.utils.data import DataLoader
@@ -27,12 +30,17 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def build_loader(cfg):
+def build_loader(cfg, world_size=1, rank=0):
     data_cfg = cfg["data"]
     dataset = MultiDatasetOptSarDataset(
         data_cfg["manifest"], "train", data_cfg["image_size"], cfg["metadata"]
     )
-    sampler = dataset.make_balanced_sampler(data_cfg.get("sampling_temperature", 0.5))
+    if world_size > 1:
+        sampler = dataset.make_distributed_balanced_sampler(
+            world_size, rank, data_cfg.get("sampling_temperature", 0.5), cfg.get("seed", 42)
+        )
+    else:
+        sampler = dataset.make_balanced_sampler(data_cfg.get("sampling_temperature", 0.5))
     return DataLoader(
         dataset,
         batch_size=data_cfg["batch_size"],
@@ -40,6 +48,8 @@ def build_loader(cfg):
         sampler=sampler,
         num_workers=data_cfg.get("num_workers", 4),
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=data_cfg.get("num_workers", 4) > 0,
+        prefetch_factor=data_cfg.get("prefetch_factor", 2) if data_cfg.get("num_workers", 4) > 0 else None,
         drop_last=True,
     )
 
@@ -68,7 +78,7 @@ def save_image(tensor, path):
 
 
 @torch.inference_mode()
-def generate_validation_samples(model, loader, cfg, device, epoch, output_dir, writer, use_amp):
+def generate_validation_samples(model, loader, cfg, device, epoch, output_dir, writer, use_amp, amp_dtype):
     """Generate a fixed first validation batch for qualitative monitoring."""
     model.eval()
     batch = next(iter(loader))
@@ -89,7 +99,7 @@ def generate_validation_samples(model, loader, cfg, device, epoch, output_dir, w
         generator=generator, device=device,
     )
     for timestep in tqdm(scheduler.timesteps, desc=f"validation epoch {epoch}", leave=False):
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             noise = model(latent, timestep.expand(len(optical)), optical, metadata)
         latent = scheduler.step(noise.float(), timestep, latent).prev_sample
     generated = model.decode_sar(latent)
@@ -119,6 +129,34 @@ def save_checkpoint(path, model, optimizer, scaler, controller, epoch, global_st
     }, path)
 
 
+def distributed_context():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size > 1:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Distributed Stage-1 training requires CUDA/NCCL")
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+    return rank, local_rank, world_size
+
+
+def sync_controller(controller, device, world_size):
+    if world_size <= 1:
+        return
+    value = torch.tensor(controller.value, device=device, dtype=torch.float64)
+    dist.all_reduce(value, op=dist.ReduceOp.SUM)
+    controller.value = float((value / world_size).item())
+
+
+def all_ranks_have_physical_samples(local_has_samples, device, world_size):
+    if world_size <= 1:
+        return local_has_samples
+    flag = torch.tensor(int(local_has_samples), device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -142,11 +180,13 @@ def main():
         cfg["train"]["epochs"] = args.epochs
     if args.lr is not None:
         cfg["train"]["lr"] = args.lr
-    seed_everything(cfg.get("seed", 42))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    rank, local_rank, world_size = distributed_context()
+    is_main = rank == 0
+    seed_everything(cfg.get("seed", 42) + rank)
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-    model = Opt2SarLDM(cfg).to(device)
-    model.vae.eval()
+    raw_model = Opt2SarLDM(cfg).to(device)
+    raw_model.vae.eval()
     scheduler = DDPMScheduler(
         num_train_timesteps=cfg["diffusion"]["timesteps"],
         beta_start=cfg["diffusion"]["beta_start"],
@@ -155,28 +195,31 @@ def main():
         prediction_type="epsilon",
     )
     alphas_cumprod = scheduler.alphas_cumprod.to(device)
-    trainable = [p for p in model.parameters() if p.requires_grad]
+    trainable = [p for p in raw_model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
         trainable, lr=cfg["train"]["lr"],
         weight_decay=cfg["train"].get("weight_decay", 0.0),
     )
-    use_amp = device.type == "cuda" and cfg["train"].get("mixed_precision") == "fp16"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    loader = build_loader(cfg)
-    validation_loader = build_validation_loader(cfg)
+    precision = cfg["train"].get("mixed_precision", "fp32")
+    use_amp = device.type == "cuda" and precision in {"fp16", "bf16"}
+    amp_dtype = torch.bfloat16 if precision == "bf16" else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and precision == "fp16")
+    loader = build_loader(cfg, world_size, rank)
+    validation_loader = build_validation_loader(cfg) if is_main else None
     physical_controller = AdaptivePhysicalWeight(cfg["loss"])
 
     output_dir = Path(cfg["train"]["output_dir"])
     checkpoint_dir = output_dir / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    if is_main:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     metrics_path = output_dir / "metrics.jsonl"
-    writer = SummaryWriter(log_dir=str(output_dir / "tensorboard"))
+    writer = SummaryWriter(log_dir=str(output_dir / "tensorboard")) if is_main else None
     start_epoch = global_step = 0
     resume = cfg["train"].get("resume_from")
     if resume:
         state = torch.load(resume, map_location=device)
-        model.load_state_dict(state["model"])
+        raw_model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         if args.lr is not None:
             for param_group in optimizer.param_groups:
@@ -187,20 +230,23 @@ def main():
         start_epoch = int(state["epoch"])
         global_step = int(state.get("global_step", 0))
 
+    model = DDP(raw_model, device_ids=[local_rank], output_device=local_rank) if world_size > 1 else raw_model
+
     grad_accum = int(cfg["train"].get("grad_accum_steps", 1))
     physical_interval = int(cfg["loss"].get("physical_interval", 1))
     physical_warmup = int(cfg["loss"].get("physical_warmup_steps", 0))
     physical_max_timestep = int(cfg["loss"].get("physical_max_timestep", cfg["diffusion"]["timesteps"] - 1))
     adaptive_update_interval = int(cfg["loss"].get("physical_update_interval", 50))
     log_every = int(cfg["train"].get("log_every_steps", 50))
-    probe_parameter = model.unet.conv_out.weight
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(start_epoch, cfg["train"]["epochs"]):
+        if hasattr(loader.sampler, "set_epoch"):
+            loader.sampler.set_epoch(epoch)
         model.train()
-        model.vae.eval()
+        raw_model.vae.eval()
         sums = {"loss": 0.0, "diffusion": 0.0, "physical": 0.0}
         steps = 0
-        progress = tqdm(loader, desc=f"stage1 epoch {epoch + 1}")
+        progress = tqdm(loader, desc=f"stage1 epoch {epoch + 1}", disable=not is_main)
         for batch_index, batch in enumerate(progress):
             max_steps = cfg["train"].get("max_steps")
             if max_steps is not None and batch_index >= max_steps:
@@ -209,22 +255,24 @@ def main():
             sar = batch["sar"].to(device, non_blocking=True)
             metadata = metadata_from_batch(batch, device)
             with torch.no_grad():
-                clean_latent = model.encode_sar(sar)
+                clean_latent = raw_model.encode_sar(sar)
             noise = torch.randn_like(clean_latent)
             timestep = torch.randint(0, scheduler.config.num_train_timesteps, (len(sar),), device=device)
             noisy_latent = scheduler.add_noise(clean_latent, noise, timestep)
 
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 prediction = model(noisy_latent, timestep, opt, metadata)
                 diffusion_loss = F.mse_loss(prediction.float(), noise.float())
                 physical_loss = diffusion_loss.new_zeros(())
                 physical_metrics = {}
                 physical_mask = timestep <= physical_max_timestep
-                use_physical = (
+                physical_scheduled = (
                     physical_interval > 0
                     and global_step >= physical_warmup
                     and global_step % physical_interval == 0
-                    and bool(physical_mask.any())
+                )
+                use_physical = physical_scheduled and all_ranks_have_physical_samples(
+                    bool(physical_mask.any()), device, world_size
                 )
                 if use_physical:
                     selected_t = timestep[physical_mask]
@@ -233,7 +281,7 @@ def main():
                         noisy_latent[physical_mask]
                         - (1.0 - alpha).sqrt() * prediction[physical_mask]
                     ) / alpha.sqrt()
-                    pred_sar = model.decode_sar(pred_clean, with_grad=True)
+                    pred_sar = raw_model.decode_sar(pred_clean, with_grad=True)
                     physical_loss, physical_metrics = sar_physical_loss(
                         pred_sar.float(), sar[physical_mask].float(),
                         metadata["sar_gsd"][physical_mask], cfg["loss"]
@@ -243,7 +291,8 @@ def main():
                         and adaptive_update_interval > 0
                         and global_step % adaptive_update_interval == 0
                     ):
-                        physical_controller.update(diffusion_loss, physical_loss, probe_parameter)
+                        physical_controller.update(diffusion_loss, physical_loss, prediction)
+                        sync_controller(physical_controller, device, world_size)
                 lambda_physical = physical_controller.value if use_physical else 0.0
                 loss = (
                     cfg["loss"].get("lambda_diffusion", 1.0) * diffusion_loss
@@ -265,14 +314,15 @@ def main():
                 sums[key] = sums.get(key, 0.0) + float(value.detach())
             steps += 1
             global_step += 1
-            progress.set_postfix(
-                loss=f"{sums['loss'] / steps:.4f}",
-                diffusion=f"{float(diffusion_loss.detach()):.4f}",
-                physical=f"{float(physical_loss.detach()):.4f}",
-                lambda_phy=f"{lambda_physical:.4f}",
-                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
-            )
-            if log_every > 0 and global_step % log_every == 0:
+            if is_main:
+                progress.set_postfix(
+                    loss=f"{sums['loss'] / steps:.4f}",
+                    diffusion=f"{float(diffusion_loss.detach()):.4f}",
+                    physical=f"{float(physical_loss.detach()):.4f}",
+                    lambda_phy=f"{lambda_physical:.4f}",
+                    lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+                )
+            if is_main and log_every > 0 and global_step % log_every == 0:
                 for key, value in values.items():
                     writer.add_scalar(f"train/{key}", float(value.detach()), global_step)
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
@@ -284,24 +334,38 @@ def main():
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        row = {"epoch": epoch + 1, "global_step": global_step, **{k: v / max(steps, 1) for k, v in sums.items()}}
-        with metrics_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row) + "\n")
-        for key, value in row.items():
-            if key not in {"epoch", "global_step"}:
-                writer.add_scalar(f"epoch/{key}", value, epoch + 1)
-        writer.flush()
-        save_checkpoint(checkpoint_dir / "last.pt", model, optimizer, scaler, physical_controller, epoch + 1, global_step, cfg)
-        if (epoch + 1) % cfg["train"].get("save_every_epochs", 1) == 0:
-            save_checkpoint(checkpoint_dir / f"epoch_{epoch + 1:04d}.pt", model, optimizer, scaler, physical_controller, epoch + 1, global_step, cfg)
+        metric_keys = sorted(sums)
+        totals = torch.tensor([sums[key] for key in metric_keys] + [steps], device=device, dtype=torch.float64)
+        if world_size > 1:
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        total_steps = max(float(totals[-1].item()), 1.0)
+        row = {"epoch": epoch + 1, "global_step": global_step, **{
+            key: float(totals[index].item()) / total_steps for index, key in enumerate(metric_keys)
+        }}
+        if is_main:
+            with metrics_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row) + "\n")
+            for key, value in row.items():
+                if key not in {"epoch", "global_step"}:
+                    writer.add_scalar(f"epoch/{key}", value, epoch + 1)
+            writer.flush()
+            save_checkpoint(checkpoint_dir / "last.pt", raw_model, optimizer, scaler, physical_controller, epoch + 1, global_step, cfg)
+            if (epoch + 1) % cfg["train"].get("save_every_epochs", 1) == 0:
+                save_checkpoint(checkpoint_dir / f"epoch_{epoch + 1:04d}.pt", raw_model, optimizer, scaler, physical_controller, epoch + 1, global_step, cfg)
         validation_interval = int(cfg["train"].get("validation_every_epochs", 0))
-        if validation_interval > 0 and (epoch + 1) % validation_interval == 0:
+        if is_main and validation_interval > 0 and (epoch + 1) % validation_interval == 0:
             generate_validation_samples(
-                model, validation_loader, cfg, device, epoch + 1,
-                output_dir, writer, use_amp,
+                raw_model, validation_loader, cfg, device, epoch + 1,
+                output_dir, writer, use_amp, amp_dtype,
             )
-        print(row)
-    writer.close()
+        if is_main:
+            print(row)
+        if world_size > 1:
+            dist.barrier()
+    if writer is not None:
+        writer.close()
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

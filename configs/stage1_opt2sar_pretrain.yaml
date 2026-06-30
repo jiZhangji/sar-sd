@@ -3,8 +3,10 @@ seed: 42
 data:
   manifest: data/multidataset_smoke/manifest.jsonl
   image_size: 512
-  batch_size: 2
-  num_workers: 4
+  # Per-GPU batch size. 2 x H100 gives global batch 32 by default.
+  batch_size: 16
+  num_workers: 12
+  prefetch_factor: 4
   # p(dataset) proportional to N^temperature；0=各数据集等概率，1=按样本量
   sampling_temperature: 0.5
 
@@ -62,7 +64,7 @@ train:
   weight_decay: 0.00001
   grad_accum_steps: 1
   grad_clip: 1.0
-  mixed_precision: fp16
+  mixed_precision: bf16
   output_dir: runs/stage1_opt2sar_pretrain
   resume_from:
   log_every_steps: 50

@@ -9,11 +9,37 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import Dataset, WeightedRandomSampler
+from torch.utils.data import Dataset, Sampler, WeightedRandomSampler
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 UNKNOWN = "unknown"
+
+
+class DistributedWeightedSampler(Sampler):
+    """Deterministic weighted global sampling followed by rank-wise sharding."""
+
+    def __init__(self, weights, num_replicas, rank, seed=42):
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.num_samples = math.ceil(len(self.weights) / self.num_replicas)
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        indices = torch.multinomial(
+            self.weights, self.total_size, replacement=True, generator=generator
+        ).tolist()
+        return iter(indices[self.rank:self.total_size:self.num_replicas])
+
+    def __len__(self):
+        return self.num_samples
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
 
 
 def _read_manifest(path):
@@ -103,6 +129,11 @@ class MultiDatasetOptSarDataset(Dataset):
         counts = Counter(str(row.get("dataset", UNKNOWN)) for row in self.records)
         weights = [counts[str(row.get("dataset", UNKNOWN))] ** (float(temperature) - 1.0) for row in self.records]
         return WeightedRandomSampler(torch.as_tensor(weights, dtype=torch.double), len(weights), replacement=replacement)
+
+    def make_distributed_balanced_sampler(self, num_replicas, rank, temperature=0.5, seed=42):
+        counts = Counter(str(row.get("dataset", UNKNOWN)) for row in self.records)
+        weights = [counts[str(row.get("dataset", UNKNOWN))] ** (float(temperature) - 1.0) for row in self.records]
+        return DistributedWeightedSampler(weights, num_replicas, rank, seed)
 
 
 def metadata_from_batch(batch, device, dtype=None):

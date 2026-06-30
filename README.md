@@ -316,17 +316,17 @@ python tools/audit_stage1_data.py \
 不重新预处理数据，直接使用已审计的 manifest：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train_stage1.py \
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 train_stage1.py \
   --config configs/stage1_opt2sar_pretrain.yaml \
   --manifest /inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/dataset/stage1_prepared/manifest.jsonl \
   --output-dir runs/stage1_opt2sar_pretrain \
-  --batch-size 8 \
+  --batch-size 16 \
   --epochs 10
 ```
 
-`--batch-size` 是每个训练进程的 batch size，也可在 `configs/stage1_opt2sar_pretrain.yaml` 的 `data.batch_size` 修改。对单张 H100 80GB、512×512 输入且开启物理损失，建议从8开始；显存稳定后测试12和16。batch并非越大越好：它会增加吞吐量和梯度稳定性，但可能降低泛化并改变合适的学习率。
+`--batch-size` 是每张GPU的 batch size，也可在 `configs/stage1_opt2sar_pretrain.yaml` 的 `data.batch_size` 修改。默认每卡16，两张H100的全局batch为 `16 × 2 × grad_accum_steps(1) = 32`。先用16跑500至1000步；如果包含物理损失的步骤仍有充足显存，再测试每卡24（全局48）。不建议一开始就用32，因为每4步的物理损失需要带梯度的VAE解码，峰值显存高于普通扩散步骤。batch也并非越大越好：大batch通常提高吞吐，但可能降低泛化，还会改变合适的学习率。
 
-当前训练器是单进程单卡版，`CUDA_VISIBLE_DEVICES=0,1` 不会自动使用两张卡，也不应直接用 `torchrun`，否则两个进程会同时写入同一份日志和权重。
+训练器使用PyTorch DDP：两卡的加权数据采样会先生成全局序列再按rank分片；只有rank 0写入日志、checkpoint和推理图；自适应物理损失权重会在两卡之间同步。默认使用更适合H100的BF16。
 
 ### 13.4 训练时查看
 
@@ -349,24 +349,24 @@ find runs/stage1_opt2sar_pretrain/samples -maxdepth 2 -type f | tail -n 20
 `--epochs` 表示从第1轮开始计算的“总目标轮数”，不是额外轮数。例如已练完10轮，希望续训到20轮：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train_stage1.py \
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 train_stage1.py \
   --config configs/stage1_opt2sar_pretrain.yaml \
   --manifest /inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/dataset/stage1_prepared/manifest.jsonl \
   --output-dir runs/stage1_opt2sar_pretrain \
   --resume-from runs/stage1_opt2sar_pretrain/checkpoints/last.pt \
-  --batch-size 8 \
+  --batch-size 16 \
   --epochs 20
 ```
 
 当前默认学习率是固定的 `1e-5`，没有学习率调度器。断点续训会恢复优化器并继续使用 checkpoint 中的学习率。如果10轮后已接近收敛，可显式降到 `5e-6`：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train_stage1.py \
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 train_stage1.py \
   --config configs/stage1_opt2sar_pretrain.yaml \
   --manifest /inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/dataset/stage1_prepared/manifest.jsonl \
   --output-dir runs/stage1_opt2sar_pretrain \
   --resume-from runs/stage1_opt2sar_pretrain/checkpoints/last.pt \
-  --batch-size 8 \
+  --batch-size 16 \
   --epochs 20 \
   --lr 5e-6
 ```
