@@ -416,3 +416,37 @@ echo $! > runs/stage1_opt2sar_pretrain/train.pid
 ```
 
 如果模型尚未缓存完整，可在前台临时启用联网模式：`OFFLINE=0 bash train_h100_2gpu.sh`。正式双卡训练建议先确认VAE和UNet已缓存，再保持默认 `OFFLINE=1`，避免两个DDP进程同时访问Hugging Face。
+
+### 13.7 正式权重下载与1-step冒烟测试
+
+`stage1_multidataset_smoke.yaml` 使用从头构建的小UNet，不能验证正式SD 1.5 UNet权重。`stage1_weight_download_smoke.yaml` 使用和正式训练完全相同的VAE与UNet，但只读取3个样本、使用64×64分辨率并训练1步。
+
+先生成极小manifest：
+
+```bash
+python tools/make_tiny_manifest.py \
+  --input /inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/dataset/stage1_prepared/manifest.jsonl \
+  --output data/weight_download_smoke/manifest.jsonl \
+  --train-samples 2 \
+  --val-samples 1
+```
+
+首次联网运行，必要的VAE和UNet文件会下载到 `HF_HOME`：
+
+```bash
+unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
+export HF_HOME=/inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/my_global_cache/huggingface
+
+CUDA_VISIBLE_DEVICES=0 python train_stage1.py \
+  --config configs/stage1_weight_download_smoke.yaml
+```
+
+然后用离线模式重跑。如果仍能完成1-step训练并生成 `runs/stage1_weight_download_smoke/checkpoints/last.pt`，即证明正式训练所需权重已缓存完整：
+
+```bash
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+CUDA_VISIBLE_DEVICES=0 python train_stage1.py \
+  --config configs/stage1_weight_download_smoke.yaml
+```
+
+本项目的正式模型只从Hub加载 `stabilityai/sd-vae-ft-mse` VAE和 `stable-diffusion-v1-5/stable-diffusion-v1-5` 下的 `unet/`；不加载tokenizer、text encoder或完整Stable Diffusion pipeline。
