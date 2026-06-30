@@ -82,7 +82,8 @@ class MultiDatasetOptSarDataset(Dataset):
     opt_gsd, polarization, incidence_angle.
     """
 
-    def __init__(self, manifest, split, image_size, metadata_cfg, require_sar=True):
+    def __init__(self, manifest, split, image_size, metadata_cfg, require_sar=True,
+                 validate_paths=True):
         self.manifest_path = Path(manifest)
         self.base = self.manifest_path.parent
         self.image_size = int(image_size)
@@ -91,13 +92,14 @@ class MultiDatasetOptSarDataset(Dataset):
         self.records = [row for row in records if not split or row.get("split", "train") == split]
         if not self.records:
             raise RuntimeError(f"No '{split}' samples in {self.manifest_path}")
-        for row in self.records:
-            opt_path = _resolve(self.base, row["opt_path"])
-            sar_path = _resolve(self.base, row["sar_path"]) if row.get("sar_path") else None
-            if not opt_path.is_file():
-                raise FileNotFoundError(f"Missing OPT image: {opt_path}")
-            if require_sar and (sar_path is None or not sar_path.is_file()):
-                raise FileNotFoundError(f"Missing SAR image for {row.get('id')}: {sar_path}")
+        if validate_paths:
+            for row in self.records:
+                opt_path = _resolve(self.base, row["opt_path"])
+                sar_path = _resolve(self.base, row["sar_path"]) if row.get("sar_path") else None
+                if not opt_path.is_file():
+                    raise FileNotFoundError(f"Missing OPT image: {opt_path}")
+                if require_sar and (sar_path is None or not sar_path.is_file()):
+                    raise FileNotFoundError(f"Missing SAR image for {row.get('id')}: {sar_path}")
 
     def __len__(self):
         return len(self.records)

@@ -33,7 +33,8 @@ def seed_everything(seed):
 def build_loader(cfg, world_size=1, rank=0):
     data_cfg = cfg["data"]
     dataset = MultiDatasetOptSarDataset(
-        data_cfg["manifest"], "train", data_cfg["image_size"], cfg["metadata"]
+        data_cfg["manifest"], "train", data_cfg["image_size"], cfg["metadata"],
+        validate_paths=data_cfg.get("validate_paths", False),
     )
     if world_size > 1:
         sampler = dataset.make_distributed_balanced_sampler(
@@ -57,7 +58,8 @@ def build_loader(cfg, world_size=1, rank=0):
 def build_validation_loader(cfg):
     data_cfg = cfg["data"]
     dataset = MultiDatasetOptSarDataset(
-        data_cfg["manifest"], "val", data_cfg["image_size"], cfg["metadata"]
+        data_cfg["manifest"], "val", data_cfg["image_size"], cfg["metadata"],
+        validate_paths=data_cfg.get("validate_paths", False),
     )
     return DataLoader(
         dataset,
@@ -185,8 +187,13 @@ def main():
     seed_everything(cfg.get("seed", 42) + rank)
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
+    if is_main:
+        print(f"[init] world_size={world_size}, device={device}, precision={cfg['train'].get('mixed_precision')}", flush=True)
+        print("[init] loading cached VAE and Stable Diffusion UNet", flush=True)
     raw_model = Opt2SarLDM(cfg).to(device)
     raw_model.vae.eval()
+    if is_main:
+        print("[init] model loaded", flush=True)
     scheduler = DDPMScheduler(
         num_train_timesteps=cfg["diffusion"]["timesteps"],
         beta_start=cfg["diffusion"]["beta_start"],
@@ -204,8 +211,15 @@ def main():
     use_amp = device.type == "cuda" and precision in {"fp16", "bf16"}
     amp_dtype = torch.bfloat16 if precision == "bf16" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and precision == "fp16")
+    if is_main:
+        print(f"[data] reading manifest: {cfg['data']['manifest']}", flush=True)
     loader = build_loader(cfg, world_size, rank)
     validation_loader = build_validation_loader(cfg) if is_main else None
+    if is_main:
+        print(
+            f"[data] train_samples={len(loader.dataset)}, batches_per_rank={len(loader)}, "
+            f"per_gpu_batch={cfg['data']['batch_size']}", flush=True,
+        )
     physical_controller = AdaptivePhysicalWeight(cfg["loss"])
 
     output_dir = Path(cfg["train"]["output_dir"])

@@ -450,3 +450,5 @@ CUDA_VISIBLE_DEVICES=0 python train_stage1.py \
 ```
 
 本项目的正式模型只从Hub加载 `stabilityai/sd-vae-ft-mse` VAE和 `stable-diffusion-v1-5/stable-diffusion-v1-5` 下的 `unet/`；不加载tokenizer、text encoder或完整Stable Diffusion pipeline。
+
+正式配置默认 `data.validate_paths: false`，因为全量数据已由 `audit_stage1_data.py` 完成一次完整性审计。如果启动时再由每个DDP进程遍历73万对数据并检查约146万个路径，共享文件系统上会长时间无输出。训练器现在会明确输出模型加载、manifest读取、样本数和每rank batch数。
