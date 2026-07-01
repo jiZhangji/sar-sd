@@ -339,6 +339,10 @@ def main():
     physical_warmup = int(cfg["loss"].get("physical_warmup_steps", 0))
     physical_max_timestep = int(cfg["loss"].get("physical_max_timestep", cfg["diffusion"]["timesteps"] - 1))
     adaptive_update_interval = int(cfg["loss"].get("physical_update_interval", 50))
+    x0_interval = int(cfg["loss"].get("x0_interval", 1))
+    x0_max_timestep = int(cfg["loss"].get("x0_max_timestep", cfg["diffusion"]["timesteps"] - 1))
+    image_interval = int(cfg["loss"].get("image_interval", 1))
+    image_max_timestep = int(cfg["loss"].get("image_max_timestep", cfg["diffusion"]["timesteps"] - 1))
     log_every = int(cfg["train"].get("log_every_steps", 50))
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(start_epoch, cfg["train"]["epochs"]):
@@ -366,7 +370,44 @@ def main():
                 prediction = model(noisy_latent, timestep, opt, metadata)
                 diffusion_loss = F.mse_loss(prediction.float(), noise.float())
                 physical_loss = diffusion_loss.new_zeros(())
+                x0_loss = diffusion_loss.new_zeros(())
+                image_loss = diffusion_loss.new_zeros(())
                 physical_metrics = {}
+                aux_metrics = {}
+                lambda_x0 = float(cfg["loss"].get("lambda_x0", 0.0))
+                lambda_image = float(cfg["loss"].get("lambda_image", 0.0))
+                if lambda_x0 > 0 and x0_interval > 0 and global_step % x0_interval == 0:
+                    x0_indices = (timestep <= x0_max_timestep).nonzero(as_tuple=False).flatten()
+                    x0_max_samples = int(cfg["loss"].get("x0_max_samples_per_rank", 0))
+                    if x0_max_samples > 0:
+                        x0_indices = x0_indices[:x0_max_samples]
+                    if len(x0_indices) > 0:
+                        selected_t = timestep[x0_indices]
+                        alpha = alphas_cumprod[selected_t].view(-1, 1, 1, 1)
+                        pred_clean_x0 = (
+                            noisy_latent[x0_indices]
+                            - (1.0 - alpha).sqrt() * prediction[x0_indices]
+                        ) / alpha.sqrt()
+                        if cfg["loss"].get("x0_loss_type", "l1") == "mse":
+                            x0_loss = F.mse_loss(pred_clean_x0.float(), clean_latent[x0_indices].float())
+                        else:
+                            x0_loss = F.l1_loss(pred_clean_x0.float(), clean_latent[x0_indices].float())
+                        aux_metrics["x0_batch_samples"] = x0_loss.new_tensor(len(x0_indices))
+                if lambda_image > 0 and image_interval > 0 and global_step % image_interval == 0:
+                    image_indices = (timestep <= image_max_timestep).nonzero(as_tuple=False).flatten()
+                    image_max_samples = int(cfg["loss"].get("image_max_samples_per_rank", 0))
+                    if image_max_samples > 0:
+                        image_indices = image_indices[:image_max_samples]
+                    if len(image_indices) > 0:
+                        selected_t = timestep[image_indices]
+                        alpha = alphas_cumprod[selected_t].view(-1, 1, 1, 1)
+                        pred_clean_image = (
+                            noisy_latent[image_indices]
+                            - (1.0 - alpha).sqrt() * prediction[image_indices]
+                        ) / alpha.sqrt()
+                        pred_sar_image = raw_model.decode_sar(pred_clean_image, with_grad=True)
+                        image_loss = F.l1_loss(pred_sar_image.float(), sar[image_indices].float())
+                        aux_metrics["image_batch_samples"] = image_loss.new_tensor(len(image_indices))
                 physical_mask = timestep <= physical_max_timestep
                 physical_indices = physical_mask.nonzero(as_tuple=False).flatten()
                 physical_max_samples = int(cfg["loss"].get("physical_max_samples_per_rank", 0))
@@ -404,6 +445,8 @@ def main():
                 loss = (
                     cfg["loss"].get("lambda_diffusion", 1.0) * diffusion_loss
                     + lambda_physical * physical_loss
+                    + lambda_x0 * x0_loss
+                    + lambda_image * image_loss
                 )
 
             scaler.scale(loss / grad_accum).backward()
@@ -415,7 +458,11 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
             values = {
                 "loss": loss, "diffusion": diffusion_loss, "physical": physical_loss,
-                "lambda_physical": loss.new_tensor(lambda_physical), **physical_metrics,
+                "x0": x0_loss, "image": image_loss,
+                "lambda_physical": loss.new_tensor(lambda_physical),
+                "lambda_x0": loss.new_tensor(lambda_x0),
+                "lambda_image": loss.new_tensor(lambda_image),
+                **physical_metrics, **aux_metrics,
             }
             for key, value in values.items():
                 sums[key] = sums.get(key, 0.0) + float(value.detach())

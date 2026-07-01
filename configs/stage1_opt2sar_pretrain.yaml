@@ -39,6 +39,15 @@ diffusion:
 
 loss:
   lambda_diffusion: 1.0
+  lambda_x0: 0.0
+  x0_interval: 1
+  x0_max_timestep: 500
+  x0_max_samples_per_rank: 0
+  x0_loss_type: l1
+  lambda_image: 0.0
+  image_interval: 1
+  image_max_timestep: 200
+  image_max_samples_per_rank: 0
   lambda_physical: 0.05
   physical_interval: 4
   adaptive_physical: true
