@@ -313,7 +313,10 @@ def main():
     eval_loaders = {}
     if is_main:
         for split in cfg["train"].get("eval_splits", ["val"]):
-            eval_loaders[split] = build_eval_loader(cfg, split)
+            try:
+                eval_loaders[split] = build_eval_loader(cfg, split)
+            except RuntimeError as error:
+                print(f"[eval] skip split={split}: {error}", flush=True)
     start_epoch = global_step = 0
     resume = cfg["train"].get("resume_from")
     if resume:
