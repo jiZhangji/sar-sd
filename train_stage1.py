@@ -70,6 +70,21 @@ def build_validation_loader(cfg):
     )
 
 
+def build_eval_loader(cfg, split):
+    data_cfg = cfg["data"]
+    dataset = MultiDatasetOptSarDataset(
+        data_cfg["manifest"], split, data_cfg["image_size"], cfg["metadata"],
+        validate_paths=data_cfg.get("validate_paths", False),
+    )
+    return DataLoader(
+        dataset,
+        batch_size=int(cfg["train"].get("eval_batch_size", data_cfg["batch_size"])),
+        shuffle=False,
+        num_workers=min(2, data_cfg.get("num_workers", 4)),
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
 def save_image(tensor, path):
     tensor = tensor.detach().float().clamp(-1, 1).add(1).mul(127.5).byte().cpu()
     array = tensor.numpy()
@@ -77,6 +92,62 @@ def save_image(tensor, path):
         Image.fromarray(array[0]).save(path)
     else:
         Image.fromarray(array[:3].transpose(1, 2, 0)).save(path)
+
+
+def save_validation_panel(optical, real_sar, generated_sar, path):
+    """Save OPT / real SAR / generated SAR / absolute-difference panels."""
+    opt = optical.detach().float().clamp(-1, 1).add(1).mul(127.5).byte().cpu().numpy()
+    real = real_sar.detach().float().clamp(-1, 1).add(1).mul(127.5).byte().cpu().numpy()[0]
+    generated = generated_sar.detach().float().clamp(-1, 1).add(1).mul(127.5).byte().cpu().numpy()[0]
+    difference = np.abs(generated.astype(np.int16) - real.astype(np.int16)).clip(0, 255).astype(np.uint8)
+    opt_rgb = opt[:3].transpose(1, 2, 0)
+    real_rgb = np.repeat(real[:, :, None], 3, axis=2)
+    generated_rgb = np.repeat(generated[:, :, None], 3, axis=2)
+    diff_rgb = np.repeat(difference[:, :, None], 3, axis=2)
+    panel = np.concatenate([opt_rgb, real_rgb, generated_rgb, diff_rgb], axis=1)
+    Image.fromarray(panel).save(path)
+
+
+def validation_metrics(generated, target):
+    generated_01 = generated.detach().float().clamp(-1, 1).add(1).mul(0.5)
+    target_01 = target.detach().float().clamp(-1, 1).add(1).mul(0.5)
+    return {
+        "gen_vs_real_l1": float(torch.mean(torch.abs(generated_01 - target_01)).cpu()),
+        "generated_mean": float(generated_01.mean().cpu()),
+        "generated_std": float(generated_01.std(unbiased=False).cpu()),
+        "real_mean": float(target_01.mean().cpu()),
+        "real_std": float(target_01.std(unbiased=False).cpu()),
+    }
+
+
+@torch.inference_mode()
+def evaluate_diffusion_loss(model, loader, scheduler, cfg, device, use_amp, amp_dtype):
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+    max_batches = cfg["train"].get("eval_max_batches")
+    generator = torch.Generator(device=device).manual_seed(int(cfg.get("seed", 42)) + 1009)
+    for batch_index, batch in enumerate(loader):
+        if max_batches is not None and batch_index >= int(max_batches):
+            break
+        opt = batch["opt"].to(device, non_blocking=True)
+        sar = batch["sar"].to(device, non_blocking=True)
+        metadata = metadata_from_batch(batch, device)
+        clean_latent = model.encode_sar(sar)
+        noise = torch.randn(clean_latent.shape, generator=generator, device=device, dtype=clean_latent.dtype)
+        timestep = torch.randint(
+            0, scheduler.config.num_train_timesteps, (len(sar),),
+            generator=generator, device=device,
+        )
+        noisy_latent = scheduler.add_noise(clean_latent, noise, timestep)
+        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            prediction = model(noisy_latent, timestep, opt, metadata)
+        loss = F.mse_loss(prediction.float(), noise.float(), reduction="sum")
+        total_loss += float(loss.detach().cpu())
+        total_samples += int(noise.numel())
+    model.train()
+    model.vae.eval()
+    return total_loss / max(total_samples, 1)
 
 
 @torch.inference_mode()
@@ -111,6 +182,16 @@ def generate_validation_samples(model, loader, cfg, device, epoch, output_dir, w
         save_image(optical[index], sample_dir / f"{stem}_opt.png")
         save_image(batch["sar"][index], sample_dir / f"{stem}_real_sar.png")
         save_image(generated[index], sample_dir / f"{stem}_generated_sar.png")
+        save_validation_panel(
+            optical[index], batch["sar"][index], generated[index],
+            sample_dir / f"{stem}_panel.png",
+        )
+    metrics = {"epoch": epoch, **validation_metrics(generated.cpu(), batch["sar"])}
+    with (output_dir / "validation_metrics.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(metrics) + "\n")
+    for key, value in metrics.items():
+        if key != "epoch":
+            writer.add_scalar(f"validation/{key}", value, epoch)
     writer.add_images("validation/generated_sar", generated.add(1).div(2), epoch)
     writer.add_images("validation/real_sar", batch["sar"].add(1).div(2), epoch)
     writer.flush()
@@ -229,6 +310,10 @@ def main():
         (output_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     metrics_path = output_dir / "metrics.jsonl"
     writer = SummaryWriter(log_dir=str(output_dir / "tensorboard")) if is_main else None
+    eval_loaders = {}
+    if is_main:
+        for split in cfg["train"].get("eval_splits", ["val"]):
+            eval_loaders[split] = build_eval_loader(cfg, split)
     start_epoch = global_step = 0
     resume = cfg["train"].get("resume_from")
     if resume:
@@ -362,6 +447,12 @@ def main():
             key: float(totals[index].item()) / total_steps for index, key in enumerate(metric_keys)
         }}
         if is_main:
+            eval_interval = int(cfg["train"].get("eval_every_epochs", 0))
+            if eval_interval > 0 and (epoch + 1) % eval_interval == 0:
+                for split, eval_loader in eval_loaders.items():
+                    row[f"{split}_diffusion"] = evaluate_diffusion_loss(
+                        raw_model, eval_loader, scheduler, cfg, device, use_amp, amp_dtype
+                    )
             with metrics_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row) + "\n")
             for key, value in row.items():
