@@ -6,6 +6,9 @@ cd "${PROJECT_ROOT}"
 
 FULL_MANIFEST="${FULL_MANIFEST:-/inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/lihao/lh/or/SAR-Generation/dataset/stage1_prepared/manifest.jsonl}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-runs/quick_diagnostics_$(date +%Y%m%d_%H%M%S)}"
+HF_HOME="${HF_HOME:-/inspire/hdd/global_user/liuxiaotong-253108540242/yanggang/my_global_cache/huggingface}"
+OFFLINE="${OFFLINE:-1}"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 GPU_BASE="${GPU_BASE:-0}"
 GPU_PAIRED="${GPU_PAIRED:-1}"
 CUDA_DEVICES="${CUDA_DEVICES:-${GPU_BASE},${GPU_PAIRED}}"
@@ -18,6 +21,7 @@ PER_GPU_BATCH="${PER_GPU_BATCH:-4}"
 SAVE_EVERY_EPOCHS="${SAVE_EVERY_EPOCHS:-20}"
 VALIDATION_EVERY_EPOCHS="${VALIDATION_EVERY_EPOCHS:-5}"
 VALIDATION_INFERENCE_STEPS="${VALIDATION_INFERENCE_STEPS:-20}"
+TRAIN_PREVIEW_EVERY_EPOCHS="${TRAIN_PREVIEW_EVERY_EPOCHS:-5}"
 EVAL_EVERY_EPOCHS="${EVAL_EVERY_EPOCHS:-5}"
 RUN_PARALLEL="${RUN_PARALLEL:-1}"
 RUN_SINGLE_DOMAIN="${RUN_SINGLE_DOMAIN:-0}"
@@ -28,13 +32,22 @@ SINGLE_DOMAIN_VAL_SAMPLES="${SINGLE_DOMAIN_VAL_SAMPLES:-64}"
 SINGLE_DOMAIN_TEST_SAMPLES="${SINGLE_DOMAIN_TEST_SAMPLES:-64}"
 
 mkdir -p "${OUTPUT_ROOT}/logs"
+export HF_HOME PYTORCH_CUDA_ALLOC_CONF
+if [[ "${OFFLINE}" == "1" ]]; then
+  export HF_HUB_OFFLINE=1
+  export TRANSFORMERS_OFFLINE=1
+else
+  unset HF_HUB_OFFLINE || true
+  unset TRANSFORMERS_OFFLINE || true
+fi
 
 echo "[quick] project=${PROJECT_ROOT}"
 echo "[quick] full_manifest=${FULL_MANIFEST}"
 echo "[quick] output_root=${OUTPUT_ROOT}"
+echo "[quick] hf_home=${HF_HOME}, offline=${OFFLINE}"
 echo "[quick] mode=${RUN_MODE}, base_gpu=${GPU_BASE}, paired_gpu=${GPU_PAIRED}, cuda_devices=${CUDA_DEVICES}, nproc=${NPROC_PER_NODE}"
 echo "[quick] overfit_samples=train:${OVERFIT_TRAIN_SAMPLES},val:${OVERFIT_VAL_SAMPLES}, epochs=${OVERFIT_EPOCHS}"
-echo "[quick] per_gpu_batch=${PER_GPU_BATCH}, val_every=${VALIDATION_EVERY_EPOCHS}, val_steps=${VALIDATION_INFERENCE_STEPS}, eval_every=${EVAL_EVERY_EPOCHS}"
+echo "[quick] per_gpu_batch=${PER_GPU_BATCH}, val_every=${VALIDATION_EVERY_EPOCHS}, train_preview_every=${TRAIN_PREVIEW_EVERY_EPOCHS}, val_steps=${VALIDATION_INFERENCE_STEPS}, eval_every=${EVAL_EVERY_EPOCHS}"
 
 python tools/make_debug_manifest.py \
   --input "${FULL_MANIFEST}" \
@@ -47,17 +60,18 @@ make_runtime_config() {
   local src="$1"
   local dst="$2"
   local batch_size="$3"
-  python - "$src" "$dst" "$batch_size" "$SAVE_EVERY_EPOCHS" "$VALIDATION_EVERY_EPOCHS" "$VALIDATION_INFERENCE_STEPS" "$EVAL_EVERY_EPOCHS" <<'PY'
+  python - "$src" "$dst" "$batch_size" "$SAVE_EVERY_EPOCHS" "$VALIDATION_EVERY_EPOCHS" "$VALIDATION_INFERENCE_STEPS" "$TRAIN_PREVIEW_EVERY_EPOCHS" "$EVAL_EVERY_EPOCHS" <<'PY'
 import sys
 import yaml
 
-src, dst, batch_size, save_every, val_every, val_steps, eval_every = sys.argv[1:]
+src, dst, batch_size, save_every, val_every, val_steps, train_preview_every, eval_every = sys.argv[1:]
 with open(src, encoding="utf-8") as handle:
     cfg = yaml.safe_load(handle)
 cfg["data"]["batch_size"] = int(batch_size)
 cfg["train"]["save_every_epochs"] = int(save_every)
 cfg["train"]["validation_every_epochs"] = int(val_every)
 cfg["train"]["validation_inference_steps"] = int(val_steps)
+cfg["train"]["train_preview_every_epochs"] = int(train_preview_every)
 cfg["train"]["eval_every_epochs"] = int(eval_every)
 cfg["train"]["eval_batch_size"] = int(batch_size)
 with open(dst, "w", encoding="utf-8") as handle:

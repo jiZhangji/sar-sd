@@ -63,6 +63,7 @@ train:
   validation_every_epochs: 1
   validation_num_samples: 4
   validation_inference_steps: 30
+  train_preview_every_epochs: 1
   eval_every_epochs: 1
   eval_splits: [val]
   eval_batch_size: 4

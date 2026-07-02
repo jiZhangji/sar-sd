@@ -56,9 +56,13 @@ def build_loader(cfg, world_size=1, rank=0):
 
 
 def build_validation_loader(cfg):
+    return build_preview_loader(cfg, "val")
+
+
+def build_preview_loader(cfg, split):
     data_cfg = cfg["data"]
     dataset = MultiDatasetOptSarDataset(
-        data_cfg["manifest"], "val", data_cfg["image_size"], cfg["metadata"],
+        data_cfg["manifest"], split, data_cfg["image_size"], cfg["metadata"],
         validate_paths=data_cfg.get("validate_paths", False),
     )
     return DataLoader(
@@ -151,8 +155,8 @@ def evaluate_diffusion_loss(model, loader, scheduler, cfg, device, use_amp, amp_
 
 
 @torch.inference_mode()
-def generate_validation_samples(model, loader, cfg, device, epoch, output_dir, writer, use_amp, amp_dtype):
-    """Generate a fixed first validation batch for qualitative monitoring."""
+def generate_validation_samples(model, loader, cfg, device, epoch, output_dir, writer, use_amp, amp_dtype, split="val"):
+    """Generate a fixed first split batch for qualitative monitoring."""
     model.eval()
     batch = next(iter(loader))
     optical = batch["opt"].to(device, non_blocking=True)
@@ -176,7 +180,8 @@ def generate_validation_samples(model, loader, cfg, device, epoch, output_dir, w
             noise = model(latent, timestep.expand(len(optical)), optical, metadata)
         latent = scheduler.step(noise.float(), timestep, latent).prev_sample
     generated = model.decode_sar(latent)
-    sample_dir = output_dir / "samples" / f"epoch_{epoch:04d}"
+    sample_root = output_dir / "samples" if split == "val" else output_dir / f"samples_{split}"
+    sample_dir = sample_root / f"epoch_{epoch:04d}"
     sample_dir.mkdir(parents=True, exist_ok=True)
     for index, stem in enumerate(batch["stem"]):
         save_image(optical[index], sample_dir / f"{stem}_opt.png")
@@ -186,18 +191,20 @@ def generate_validation_samples(model, loader, cfg, device, epoch, output_dir, w
             optical[index], batch["sar"][index], generated[index],
             sample_dir / f"{stem}_panel.png",
         )
-    metrics = {"epoch": epoch, **validation_metrics(generated.cpu(), batch["sar"])}
-    with (output_dir / "validation_metrics.jsonl").open("a", encoding="utf-8") as handle:
+    metrics = {"epoch": epoch, "split": split, **validation_metrics(generated.cpu(), batch["sar"])}
+    metrics_name = "validation_metrics.jsonl" if split == "val" else f"{split}_preview_metrics.jsonl"
+    with (output_dir / metrics_name).open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(metrics) + "\n")
+    tensorboard_prefix = "validation" if split == "val" else f"{split}_preview"
     for key, value in metrics.items():
-        if key != "epoch":
-            writer.add_scalar(f"validation/{key}", value, epoch)
-    writer.add_images("validation/generated_sar", generated.add(1).div(2), epoch)
-    writer.add_images("validation/real_sar", batch["sar"].add(1).div(2), epoch)
+        if key not in {"epoch", "split"}:
+            writer.add_scalar(f"{tensorboard_prefix}/{key}", value, epoch)
+    writer.add_images(f"{tensorboard_prefix}/generated_sar", generated.add(1).div(2), epoch)
+    writer.add_images(f"{tensorboard_prefix}/real_sar", batch["sar"].add(1).div(2), epoch)
     writer.flush()
     model.train()
     model.vae.eval()
-    print(f"[validation] saved {len(generated)} samples to {sample_dir}")
+    print(f"[{tensorboard_prefix}] saved {len(generated)} samples to {sample_dir}")
 
 
 def save_checkpoint(path, model, optimizer, scaler, controller, epoch, global_step, cfg):
@@ -296,6 +303,11 @@ def main():
         print(f"[data] reading manifest: {cfg['data']['manifest']}", flush=True)
     loader = build_loader(cfg, world_size, rank)
     validation_loader = build_validation_loader(cfg) if is_main else None
+    train_preview_loader = (
+        build_preview_loader(cfg, "train")
+        if is_main and int(cfg["train"].get("train_preview_every_epochs", 0)) > 0
+        else None
+    )
     if is_main:
         print(
             f"[data] train_samples={len(loader.dataset)}, batches_per_rank={len(loader)}, "
@@ -516,7 +528,13 @@ def main():
         if is_main and validation_interval > 0 and (epoch + 1) % validation_interval == 0:
             generate_validation_samples(
                 raw_model, validation_loader, cfg, device, epoch + 1,
-                output_dir, writer, use_amp, amp_dtype,
+                output_dir, writer, use_amp, amp_dtype, split="val",
+            )
+        train_preview_interval = int(cfg["train"].get("train_preview_every_epochs", 0))
+        if is_main and train_preview_interval > 0 and (epoch + 1) % train_preview_interval == 0:
+            generate_validation_samples(
+                raw_model, train_preview_loader, cfg, device, epoch + 1,
+                output_dir, writer, use_amp, amp_dtype, split="train",
             )
         if is_main:
             print(row)
